@@ -1,10 +1,21 @@
 """端到端 API 测试：上传、幂等、拒收、修订交错、重启恢复。"""
 from __future__ import annotations
 
+import importlib
+import sys
 import threading
 import time
 
-import pytest
+
+APP_MODULES = [
+    "app.config",
+    "app.database",
+    "app.analysis",
+    "app.csv_parser",
+    "app.services",
+    "app.schemas",
+    "app.main",
+]
 
 
 def _csv(rows, header="subject_id,day,outcome"):
@@ -282,3 +293,196 @@ def test_health_and_listing(app_client):
     assert client.get("/health").json()["status"] == "ok"
     assert client.get("/api/revisions").json() == []
     assert client.get("/api/analyses/current").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 线程退场交错：旧版计算结束时已观察到空队列，但线程尚未退出；新上传恰好落在
+# “线程仍 alive”的窗口内。修复前 ensure_worker 会误判线程仍在工作而不拉起，
+# 新修订永久停在 PENDING。
+# ---------------------------------------------------------------------------
+
+def _restart_app(tmp_path, monkeypatch, db_filename="restart.db"):
+    """在同一个数据库目录上模拟进程重启（重新导入模块 + 新建 TestClient）。"""
+    for name in APP_MODULES:
+        sys.modules.pop(name, None)
+    monkeypatch.setenv("COHORT_DB_PATH", str(tmp_path / "data" / db_filename))
+    monkeypatch.setenv("COHORT_UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("COHORT_HORIZON_DAYS", "30")
+
+    from fastapi.testclient import TestClient
+
+    # 必须先重新导入 config，刷新 app 包上的模块属性（否则 from . import config
+    # 会命中上一个测试遗留的旧模块，写进旧的临时库）。
+    importlib.import_module("app.config")
+    database = importlib.import_module("app.database")
+    main = importlib.import_module("app.main")
+    services = importlib.import_module("app.services")
+    return TestClient(main.app), database, services
+
+
+def _stop_worker_quietly(services, timeout=5.0):
+    """测试清理：通知后台线程停止并等待其退出（不掩盖测试本身的断言失败）。"""
+    services._stop_event.set()
+    worker = services._worker_thread
+    if worker is not None:
+        worker.join(timeout=timeout)
+    services._stop_event.clear()
+
+
+def test_upload_during_worker_shutdown_window_is_handled(tmp_path, monkeypatch):
+    """旧线程已判定队列为空、尚未清空 _worker_thread 时上传：新版必须被接手。"""
+    client, db, services = _restart_app(tmp_path, monkeypatch, "window.db")
+    try:
+        with client:
+            rows1 = [("S1", 1, "READMISSION"), ("S2", 2, "CENSORED")]
+            assert _upload(client, 1, rows1).status_code == 200
+            _wait_status(client, 1, "COMPLETED")
+
+            entered = threading.Event()
+            release = threading.Event()
+            real_pending = db.pending_revisions
+            calls = {"n": 0}
+
+            def gated_pending():
+                calls["n"] += 1
+                result = real_pending()
+                # 第二次调用即旧线程处理完 rev1 后的退场判定：此刻队列已空。
+                # 拦在这里，复现“查到空队列 -> 尚未退出”的窗口。
+                if calls["n"] == 2:
+                    entered.set()
+                    assert release.wait(timeout=5), "新上传未落入线程退场窗口"
+                return result
+
+            monkeypatch.setattr(services.db, "pending_revisions", gated_pending)
+
+            assert _upload(client, 2, [("S3", 3, "DEATH")]).status_code == 200
+            assert entered.wait(timeout=5), "旧工作线程未观察到空队列"
+
+            # 此刻旧线程确实仍存活（卡在退场窗口内），才开始上传新版本
+            old_worker = services._worker_thread
+            assert old_worker is not None and old_worker.is_alive()
+
+            # 旧线程仍 alive（卡在退场窗口），新上传到达。
+            up3 = _upload(client, 3, [("S4", 4, "READMISSION")])
+            assert up3.status_code == 200, up3.text
+            assert up3.json()["current_revision"] == 3
+
+            # 不允许再上传一次或手动重算来解卡。
+            release.set()
+
+            # rev3（现行）必须自动完成；rev2 若先算完也只能是历史结论
+            data = _wait_status(client, 3, "COMPLETED", timeout=8).json()
+            assert data["is_current"] is True
+            assert client.get("/api/analyses/current").json()["revision"] == 3
+            assert db.get_analysis_row(3)["status"] == "COMPLETED"
+            rev2 = client.get("/api/analyses/2")
+            assert rev2.status_code == 200
+            assert rev2.json()["is_current"] is False
+
+            # 手动重算无需参与解卡；且此后仍可正常手动重算现行版
+            assert client.post("/api/analyses/recompute").status_code == 200
+            _wait_status(client, 3, "COMPLETED")
+            monkeypatch.undo()
+    finally:
+        _stop_worker_quietly(services)
+
+
+def test_upload_while_old_computation_still_running(tmp_path, monkeypatch):
+    """上传发生在旧版计算期间：旧结论绝不作为现行结果，新版随后继续计算。"""
+    client, db, services = _restart_app(tmp_path, monkeypatch, "interleave.db")
+    try:
+        with client:
+            assert _upload(client, 1, [("S1", 1, "READMISSION")]).status_code == 200
+            _wait_status(client, 1, "COMPLETED")
+
+            entered = threading.Event()
+            release = threading.Event()
+            real_load = db.load_records
+
+            def gated_load(revision):
+                if revision == 2:
+                    entered.set()
+                    assert release.wait(timeout=5), "rev3 未在 rev2 计算期间受理"
+                return real_load(revision)
+
+            monkeypatch.setattr(services.db, "load_records", gated_load)
+            assert _upload(client, 2, [("S2", 2, "DEATH")]).status_code == 200
+            assert entered.wait(timeout=5), "rev2 计算未启动"
+
+            # rev2 计算中上传 rev3：rev2 立即失去现行资格，查询不得给出 rev2 结论
+            assert _upload(client, 3, [("S3", 1, "CENSORED")]).status_code == 200
+            cur = client.get("/api/analyses/current")
+            assert cur.status_code == 409
+            assert cur.json()["error"] == "ANALYSIS_PENDING"
+
+            release.set()
+            data = _wait_status(client, 3, "COMPLETED", timeout=8).json()
+            assert data["revision"] == 3 and data["is_current"] is True
+            assert data["summary"]["n_subjects"] == 1
+            time.sleep(0.1)
+            assert db.get_analysis_row(2)["status"] == "SUPERSEDED"
+            assert client.get("/api/analyses/2").status_code == 409
+            assert client.get("/api/analyses/current").json()["revision"] == 3
+            monkeypatch.undo()
+    finally:
+        _stop_worker_quietly(services)
+
+
+def test_restart_recovers_leftover_pending(tmp_path, monkeypatch):
+    """重启后遗留 PENDING：不靠再次上传或手动重算，启动即自动恢复并完成。"""
+    client, db, services = _restart_app(tmp_path, monkeypatch, "restart.db")
+    with client:
+        assert _upload(client, 1, [("S1", 1, "READMISSION")]).status_code == 200
+        _wait_status(client, 1, "COMPLETED")
+        assert _upload(client, 2, [("S2", 2, "DEATH")]).status_code == 200
+        _wait_status(client, 2, "COMPLETED")
+
+    # 旧进程的后台线程必须彻底退出后再注入遗留状态，否则它可能在"重启"前
+    # 抢先算完 rev3，使断言失去意义。
+    _stop_worker_quietly(services)
+
+    # 模拟进程在 rev3 重算完成前退出：直接留下 PENDING 分析行
+    db.accept_revision(3, "sha-of-rev3", [("S3", 3, "CENSORED")])
+    assert db.get_analysis_row(3)["status"] == "PENDING"
+
+    # 重新导入模块 = 新进程视角；lifespan 的 recover_on_startup 自动接手
+    client2, db2, services2 = _restart_app(tmp_path, monkeypatch, "restart.db")
+    try:
+        with client2:
+            data = _wait_status(client2, 3, "COMPLETED", timeout=8).json()
+            assert data["is_current"] is True
+            assert data["summary"]["n_subjects"] == 1
+            assert client2.get("/api/analyses/current").json()["revision"] == 3
+            assert client2.get("/api/analyses/1").json()["is_current"] is False
+    finally:
+        _stop_worker_quietly(services2)
+
+
+def test_restart_supersedes_leftover_pending_for_non_current_revision(tmp_path, monkeypatch):
+    """遗留 PENDING 若已非现行版本（崩溃在作废前）：不计算、直接作废，不阻塞队列。"""
+    client, db, services = _restart_app(tmp_path, monkeypatch, "stale.db")
+    with client:
+        assert _upload(client, 1, [("S1", 1, "READMISSION")]).status_code == 200
+        _wait_status(client, 1, "COMPLETED")
+    _stop_worker_quietly(services)
+
+    # 直接构造非现行却仍 PENDING 的遗留行（模拟极端崩溃点）
+    db.accept_revision(2, "sha2", [("S2", 2, "DEATH")])
+    db.accept_revision(3, "sha3", [("S3", 3, "CENSORED")])
+    # rev2 已在受理时被置 SUPERSEDED；人为回拨成 PENDING 以模拟崩溃残留
+    with db.immediate_transaction() as conn:
+        conn.execute("UPDATE analyses SET status='PENDING' WHERE revision=2;")
+    assert db.get_analysis_row(2)["status"] == "PENDING"
+
+    client2, db2, services2 = _restart_app(tmp_path, monkeypatch, "stale.db")
+    try:
+        with client2:
+            data = _wait_status(client2, 3, "COMPLETED", timeout=8).json()
+            assert data["is_current"] is True
+            deadline = time.time() + 5
+            while time.time() < deadline and db2.pending_revisions():
+                time.sleep(0.02)
+            assert db2.pending_revisions() == []
+            assert db2.get_analysis_row(2)["status"] == "SUPERSEDED"
+    finally:
+        _stop_worker_quietly(services2)

@@ -15,6 +15,9 @@ _worker_lock = threading.Lock()
 _worker_thread: Optional[threading.Thread] = None
 _running_revision: Optional[int] = None
 _stop_event = threading.Event()
+# 唤醒代数：ensure_worker 发现线程仍存活时递增；工作线程在"队列已空"的退场判定
+# 中于锁内比对代数，从而不会漏掉恰在退场窗口内受理的新修订。
+_wake_generation = 0
 
 
 def _run_revision(revision: int) -> None:
@@ -28,6 +31,12 @@ def _run_revision(revision: int) -> None:
             return
         if row["status"] != "PENDING":
             logger.info("修订 %s 状态为 %s，无需重算", revision, row["status"])
+            return
+        # 遗留的 PENDING 若已不是 CURRENT（例如进程在受理事务后、旧分析作废前
+        # 崩溃），直接作废，不计算也不发布。
+        if not db.is_current_revision(revision):
+            logger.warning("修订 %s 已非现行版本，跳过计算并置为 SUPERSEDED", revision)
+            db.mark_analysis_superseded(revision)
             return
 
         logger.info("开始重算修订 %s", revision)
@@ -48,27 +57,63 @@ def _run_revision(revision: int) -> None:
 
 
 def _worker_loop() -> None:
-    """后台守护线程循环：只要还有 PENDING 修订就逐个重算。"""
+    """后台守护线程循环：只要还有 PENDING 修订就逐个重算。
+
+    退场握手（修复修订入队与线程退出的交错）：
+    - 每轮先记下当前唤醒代数，再查 PENDING 队列；若队列为空，则必须在
+      ``_worker_lock`` 内重新检查"是否有新的唤醒代数 / 队列是否仍为空"。
+    - ``ensure_worker`` 在发现线程仍存活时递增代数，因此上传受理与退场判定
+      互斥：要么上传让线程看到新代数继续跑，要么线程先清空句柄、上传随后
+      拉起新线程。两种顺序都不会让新的 PENDING 无人处理。
+    """
+    global _worker_thread
     logger.info("分析工作线程启动")
-    while not _stop_event.is_set():
-        pending = db.pending_revisions()
-        if not pending:
-            break
-        revision = pending[0]
-        _run_revision(revision)
-    with _worker_lock:
-        global _worker_thread
-        _worker_thread = None
-    logger.info("分析工作线程退出")
+    try:
+        while True:
+            with _worker_lock:
+                generation = _wake_generation
+                if _stop_event.is_set():
+                    break
+            try:
+                pending = db.pending_revisions()
+                if pending:
+                    _run_revision(pending[0])
+                    continue
+
+                # 队列暂时为空：在锁内做最终退场判定，避免与 ensure_worker 竞态
+                with _worker_lock:
+                    if _stop_event.is_set() or _wake_generation != generation:
+                        continue  # 退场窗口内有新任务被受理，重新检查队列
+                    if db.pending_revisions():
+                        continue  # 受理事务已提交但唤醒尚未发生，保险起见再查一次
+                    _worker_thread = None
+                    break
+            except Exception:  # noqa: BLE001 - 单次读取/重算异常不应杀死工作线程
+                logger.exception("分析工作线程循环异常，稍后重试")
+                _stop_event.wait(timeout=1.0)
+    finally:
+        # 无论正常退出还是异常退出，都清理自己的句柄（仅当句柄仍指向自己），
+        # 让下一次 ensure_worker 能可靠地拉起新线程，而不是看到"活着的僵尸"。
+        with _worker_lock:
+            if _worker_thread is threading.current_thread():
+                _worker_thread = None
+        logger.info("分析工作线程退出")
 
 
 def ensure_worker() -> bool:
     """确保有一个后台工作线程在处理 PENDING 修订。返回是否新启动了线程。"""
-    global _worker_thread
+    global _worker_thread, _wake_generation
     with _worker_lock:
-        if _worker_thread is not None and _worker_thread.is_alive():
-            return False
+        if _worker_thread is not None:
+            if _worker_thread.is_alive():
+                # 线程可能正处在"已看到空队列、尚未退出"的窗口：递增代数使其
+                # 在锁内重查队列，而不是直接退场把新任务晾在 PENDING。
+                _wake_generation += 1
+                return False
+            # 线程已结束但句柄尚未被自身清理（异常终止等）：视为可重启
+            _worker_thread = None
         _stop_event.clear()
+        _wake_generation += 1
         t = threading.Thread(target=_worker_loop, name="analysis-worker", daemon=True)
         _worker_thread = t
         t.start()

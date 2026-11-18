@@ -318,6 +318,23 @@ def mark_analysis_pending(revision: int) -> None:
         )
 
 
+def mark_analysis_superseded(revision: int, reason: str = "修订已被新版本取代") -> None:
+    """把未完成的分析直接置为 SUPERSEDED（不计算、不发布）。"""
+    now = _utcnow()
+    with write_lock, immediate_transaction() as conn:
+        conn.execute(
+            "UPDATE analyses SET status = 'SUPERSEDED', finished_at = ?, error = ? "
+            "WHERE revision = ? AND status = 'PENDING';",
+            (now, reason, revision),
+        )
+
+
+def is_current_revision(revision: int) -> bool:
+    with read_session() as conn:
+        rev = get_revision(conn, revision)
+        return rev is not None and rev["status"] == "CURRENT"
+
+
 def get_analysis_row(revision: int) -> Optional[sqlite3.Row]:
     with read_session() as conn:
         return conn.execute(
